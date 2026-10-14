@@ -12,6 +12,7 @@ import cloudinary
 import cloudinary.uploader
 import requests
 from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -24,6 +25,7 @@ from google import genai
 from groq import Groq
 from cachetools import TTLCache
 from subtitles import write_subtitles
+import config
 from config import (
     GEMINI_API_KEY,
     GEMINI_MODEL,
@@ -31,8 +33,11 @@ from config import (
     CLOUDINARY_CLOUD_NAME,
     CLOUDINARY_API_KEY,
     CLOUDINARY_API_SECRET,
-GROQ_ENABLED,
+    DID_API_KEY,
+    DID_SOURCE_URL,
+    GROQ_ENABLED,
     CLOUDINARY_ENABLED,
+    DID_ENABLED,
     validate_config,
 )
 import voices
@@ -155,6 +160,18 @@ class QuizQuestion(BaseModel):
 class QuizResponse(BaseModel):
     questions: list[QuizQuestion]
 
+
+class FlashcardRequest(BaseModel):
+    transcript: str = Field(..., min_length=1, max_length=30000)
+    count: int = Field(5, ge=5, le=10)
+
+
+class Flashcard(BaseModel):
+    id: int = Field(..., ge=1)
+    front: str = Field(..., min_length=1, max_length=500)
+    back: str = Field(..., min_length=1, max_length=2000)
+    hint: str = Field(..., min_length=1, max_length=300)
+
 # --------------------------
 # Helpers
 # --------------------------
@@ -169,17 +186,33 @@ async def generate_tts(text: str, output_file: str, voice_id: str = "en-US-GuyNe
     )
     await communicate.save(output_file)
 
-def get_celebrity_video(celebrity_name: str):
-    input_video_dir = os.path.join(BASE_DIR, "backend", "input")
-    celebrity_video = os.path.join(input_video_dir, f"{celebrity_name.lower()}.mp4")
-    
-    if os.path.exists(celebrity_video):
-        print(f"🎬 Using celebrity video: {celebrity_video}")
-        return celebrity_video
-    else:
-        input_video = os.path.join(input_video_dir, "modi.mp4")
-        print(f"🎬 Using default video: {input_video}")
-        return input_video
+ALLOWED_CELEBRITIES = {"modi", "owl", "salman", "srk"}
+
+
+def get_celebrity_video(celebrity_name: str) -> str:
+    input_video_dir = os.path.realpath(
+        os.path.join(BASE_DIR, "backend", "input")
+    )
+
+    name = celebrity_name.strip().lower() if isinstance(celebrity_name, str) else ""
+    if name not in ALLOWED_CELEBRITIES:
+        name = "modi"
+
+    candidate = os.path.realpath(
+        os.path.join(input_video_dir, f"{name}.mp4")
+    )
+
+    if (
+        os.path.commonpath([input_video_dir, candidate]) == input_video_dir
+        and os.path.isfile(candidate)
+    ):
+        print(f"Using celebrity video: {name}")
+        return candidate
+
+    fallback = os.path.realpath(os.path.join(input_video_dir, "modi.mp4"))
+    print("Using default celebrity video: modi")
+    return fallback
+
 
 # --------------------------
 # Serve Files
@@ -201,6 +234,133 @@ app.mount("/transcript-stream", StaticFiles(directory=text_output_path), name="t
 @app.get("/")
 def home():
     return {"message": "AI Lesson Generator Backend Running"}
+
+
+# --------------------------
+# Health Check Helpers & Routes
+# --------------------------
+def check_ffmpeg_readiness() -> tuple[bool, str | None]:
+    """Verify that FFmpeg is available and executable."""
+    try:
+        subprocess.run(
+            ["ffmpeg", "-version"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        return True, None
+    except FileNotFoundError:
+        return False, "FFmpeg is not installed or not available in PATH"
+    except subprocess.CalledProcessError as exc:
+        return False, f"FFmpeg availability check failed with returncode {exc.returncode}"
+    except Exception as exc:
+        return False, f"FFmpeg check failed: {exc}"
+
+
+def check_gemini_key_readiness() -> tuple[bool, str | None]:
+    """Verify that the primary Gemini API key is configured."""
+    key = getattr(config, "GEMINI_API_KEY", None)
+    if not key or not str(key).strip():
+        return False, "Gemini API key is missing"
+    return True, None
+
+
+def check_default_input_video_readiness() -> tuple[bool, str | None]:
+    """Verify that the default input video (input/modi.mp4) is present."""
+    input_video_path = os.path.join(BASE_DIR, "backend", "input", "modi.mp4")
+    if not os.path.isfile(input_video_path):
+        return False, "Default input video (input/modi.mp4) is absent"
+    return True, None
+
+
+def check_outputs_writable_readiness() -> tuple[bool, str | None]:
+    """Verify that the outputs/ directory exists and is writable."""
+    try:
+        os.makedirs(base_output_path, exist_ok=True)
+        probe_path = os.path.join(base_output_path, f".write_probe_{uuid.uuid4().hex}.tmp")
+        with open(probe_path, "w", encoding="utf-8") as f:
+            f.write("ready")
+        os.remove(probe_path)
+        return True, None
+    except Exception as exc:
+        return False, f"Outputs directory is not writable: {exc}"
+
+
+def get_optional_integrations_status() -> dict[str, str]:
+    """Report status of optional integrations without impacting readiness."""
+    groq_enabled = bool(getattr(config, "GROQ_ENABLED", False))
+    cloudinary_enabled = bool(getattr(config, "CLOUDINARY_ENABLED", False))
+    did_enabled = bool(
+        getattr(config, "DID_ENABLED", False)
+        or (getattr(config, "DID_API_KEY", None) and getattr(config, "DID_SOURCE_URL", None))
+    )
+    return {
+        "groq": "enabled" if groq_enabled else "disabled",
+        "cloudinary": "enabled" if cloudinary_enabled else "disabled",
+        "did": "enabled" if did_enabled else "disabled",
+    }
+
+
+@app.get("/health/live")
+def health_live():
+    """Liveness probe: confirms the AI service process is running."""
+    return {"status": "alive"}
+
+
+@app.get("/health/ready")
+def health_ready():
+    """Readiness probe: reports FFmpeg, API-key, storage, and optional integration status."""
+    reasons: list[str] = []
+    checks: dict[str, str] = {}
+
+    ffmpeg_ok, ffmpeg_reason = check_ffmpeg_readiness()
+    if ffmpeg_ok:
+        checks["ffmpeg"] = "available"
+    else:
+        checks["ffmpeg"] = "unavailable"
+        reasons.append(ffmpeg_reason or "FFmpeg is unavailable")
+
+    gemini_ok, gemini_reason = check_gemini_key_readiness()
+    if gemini_ok:
+        checks["gemini_api_key"] = "configured"
+    else:
+        checks["gemini_api_key"] = "missing"
+        reasons.append(gemini_reason or "Gemini API key is missing")
+
+    video_ok, video_reason = check_default_input_video_readiness()
+    if video_ok:
+        checks["default_input_video"] = "available"
+    else:
+        checks["default_input_video"] = "absent"
+        reasons.append(video_reason or "Default input video (input/modi.mp4) is absent")
+
+    outputs_ok, outputs_reason = check_outputs_writable_readiness()
+    if outputs_ok:
+        checks["outputs_writable"] = "writable"
+    else:
+        checks["outputs_writable"] = "not_writable"
+        reasons.append(outputs_reason or "Outputs directory is not writable")
+
+    optional = get_optional_integrations_status()
+
+    if reasons:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "not_ready",
+                "reason": "; ".join(reasons),
+                "reasons": reasons,
+                "checks": checks,
+                "optional": optional,
+            },
+        )
+
+    return {
+        "status": "ready",
+        "checks": checks,
+        "optional": optional,
+    }
 
 @app.get("/transcript/{filename}")
 def get_transcript(filename: str):
@@ -431,6 +591,70 @@ def generate_quiz(data: QuizRequest):
 
     return {"questions": []}
 
+
+@app.post("/generate-flashcards", response_model=list[Flashcard])
+def generate_flashcards(data: FlashcardRequest):
+    prompt = f"""
+    Create exactly {data.count} study flashcards from this lesson transcript.
+    Focus on distinct, important concepts and use concise question-and-answer pairs.
+    Do not introduce facts that are not supported by the transcript.
+
+    Transcript:
+    {data.transcript}
+
+    Respond with ONLY a valid JSON array, without markdown or code fences:
+    [
+      {{"id": 1, "front": "Question", "back": "Answer", "hint": "Short recall hint"}}
+    ]
+
+    Each card must have a unique question and a useful hint. Generate exactly
+    {data.count} cards, with IDs numbered from 1 through {data.count}.
+    """
+
+    for attempt in range(2):
+        try:
+            try:
+                response = gemini_client.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=prompt,
+                )
+                text = response.text.strip()
+            except Exception as gemini_error:
+                logger.warning("Gemini flashcard generation failed: %s", gemini_error)
+                if not groq_client:
+                    raise
+                groq_response = groq_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.4,
+                    max_tokens=3000,
+                )
+                text = groq_response.choices[0].message.content.strip()
+
+            if text.startswith("```"):
+                text = text.split("\n", 1)[-1]
+                if text.endswith("```"):
+                    text = text[:-3]
+
+            flashcard_data = json.loads(text.strip())
+            if not isinstance(flashcard_data, list) or len(flashcard_data) != data.count:
+                raise ValueError(f"Expected exactly {data.count} flashcards.")
+
+            cards = [Flashcard.model_validate(card) for card in flashcard_data]
+            if len({card.front.strip().casefold() for card in cards}) != data.count:
+                raise ValueError("Flashcard questions must be unique.")
+
+            return [
+                Flashcard.model_validate({**card.model_dump(), "id": index})
+                for index, card in enumerate(cards, start=1)
+            ]
+        except Exception as error:
+            logger.warning(
+                "Flashcard generation attempt %s failed: %s", attempt + 1, error
+            )
+
+    raise HTTPException(status_code=503, detail="Failed to generate flashcards")
+
 # --------------------------
 # Generate Lesson Endpoint
 # --------------------------
@@ -595,11 +819,11 @@ async def process_lesson(data: LessonRequest, base_filename: str):
         if data.preferences:
             preferences_text = f"""
         User Preferences:
-        - Learning Goal: {data.preferences.get("learning_goal", "Not specified")}
-        - Interested Topics: {", ".join(data.preferences.get("interested_topics", [])) if isinstance(data.preferences.get("interested_topics"), list) else data.preferences.get("interested_topics", "Not specified")}
-        - Experience Level: {data.preferences.get("experience_level", "Not specified")}
-        - Weekly Commitment: {data.preferences.get("weekly_commitment", "Not specified")}
+        - Explanation Type: {data.preferences.get("explanation_type", "Not specified")}
         - Learning Style: {data.preferences.get("learning_style", "Not specified")}
+        - Teaching Pace: {data.preferences.get("teaching_pace", "Not specified")}
+        - Example Type: {data.preferences.get("example_type", "Not specified")}
+        - Focus Area: {data.preferences.get("focus_area", "Not specified")}
         """
         else:
             preferences_text = "User Preferences: Not provided"
@@ -617,9 +841,11 @@ async def process_lesson(data: LessonRequest, base_filename: str):
         {preferences_text}
 
         Instructions:
-        - Adapt explanation based on user's experience level
-        - Adjust depth based on learning goal
-        - Match explanation style with preferred learning style
+        - Adapt the explanation to the user's preferred explanation type.
+        - Adjust the teaching speed and depth to match the user's preferred teaching pace.
+        - Use examples that match the user's preferred example type.
+        - Focus the explanation on the user's selected focus area.
+        - Match the explanation style with the user's preferred learning style.
         """
 
         print("\n📊 USER PREFERENCES:\n")
